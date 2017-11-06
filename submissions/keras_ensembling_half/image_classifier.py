@@ -4,6 +4,7 @@ import os
 from datetime import datetime
 
 from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.metrics import accuracy_score
 
 from joblib import delayed
 from joblib import Parallel
@@ -15,30 +16,38 @@ from skimage.io import imread as skimage_imread
 
 from keras import backend as K
 from keras.models import Model
-from keras.layers import Dense, GlobalAveragePooling2D, Concatenate
+from keras.layers import Dense, GlobalAveragePooling2D
 from keras.optimizers import Adam
 from keras.callbacks import ReduceLROnPlateau, ModelCheckpoint, LearningRateScheduler
 from keras.losses import categorical_crossentropy
 
-from keras.applications.inception_resnet_v2 import InceptionResNetV2
-from keras_contrib.applications.densenet import DenseNetImageNet161
-from keras.utils.data_utils import get_file
-
-from keras_contrib.applications.densenet import preprocess_input as densenet_preprocess_input
-from keras.applications.inception_resnet_v2 import preprocess_input as tf_preprocess_input
+from keras.applications.xception import Xception, preprocess_input as xception_preprocess_input
+from keras.applications.resnet50 import ResNet50, preprocess_input as resnet_preprocess_input
+from keras.applications.inception_resnet_v2 import InceptionResNetV2, preprocess_input as irv2_preprocess_input
+from keras_contrib.applications.densenet import DenseNetImageNet161, preprocess_input as densenet_preprocess_input
 
 
 SUBMIT_NAME = os.path.basename(os.path.dirname(__file__))
 
 SEED = 123456789
 N_JOBS = 10
-
-BASE_WEIGHT_URL = 'https://github.com/vfdev-5/pollenating_insects_3/releases/download/v1.0/'
+SIZE = (224, 224)  # Minimal size for ResNet50
 
 
 class ImageClassifier(object):
     def __init__(self):
-        self.model = self._build_model()
+        self._build_models()
+
+        self.batch_size = 16
+        self.valid_ratio = 0.2
+        self.n_epochs = 6
+        self.n_tta = 10
+        self.learning_rates = [
+            0.000234,  # inception-resnet
+            0.000123,  # resnet
+            0.000234,  # xception
+            0.000015,  # densenet
+        ]
 
         if 'LOGS_PATH' in os.environ:
             self.logs_path = os.environ['LOGS_PATH']
@@ -46,118 +55,139 @@ class ImageClassifier(object):
             now = datetime.now()
             self.logs_path = 'logs_%s_%s' % (SUBMIT_NAME, now.strftime("%Y%m%d_%H%M"))
 
-    def fit(self, img_loader):
+    def _train_first_level(self, img_loader):
+        print("\n\n First level training \n")
+        for i, (model, preproc_fns) in enumerate(zip(self.models, self.preprocessing_fns)):
 
-        batch_size = 32
-        valid_ratio = 0.2
-        n_epochs = 3
+            print("\n---------------------------------------------------------------")
+            print("\tTrain model : %s (%i / %i)" % (model.name, i + 1, len(self.models)))
+            print("---------------------------------------------------------------\n")
 
-        if 'LOCAL_TESTING' in os.environ:
-            print("\n\n------------------------------")
-            print("-------- LOCAL TESTING -------")
-            print("------------------------------\n\n")
-            if 'LOAD_BEST_MODEL' in os.environ:
-                load_pretrained_model(self.model, self.logs_path)
-                # return
+            best_weights_filename = os.path.join(self.logs_path, "weights", "%s_best_val_loss.h5" % model.name)
+            if os.path.exists(best_weights_filename):
+                print("Found weights at %s" % best_weights_filename)
+                continue
 
-        train_gen_builder = BatchGeneratorBuilder(img_loader,
-                                                  shuffle=True,
-                                                  chunk_size=batch_size * 2,
-                                                  n_jobs=N_JOBS)
+            train_gen_builder = BatchGeneratorBuilder(img_loader,
+                                                      shuffle=True,
+                                                      transform_img=preproc_fns[0],
+                                                      transform_test_img=preproc_fns[1],
+                                                      chunk_size=self.batch_size * 2,
+                                                      n_jobs=N_JOBS)
 
-        gen_train, gen_valid, nb_train, nb_valid, class_weights = \
-            train_gen_builder.get_train_valid_generators(batch_size=batch_size,
-                                                         valid_ratio=valid_ratio)
+            gen_train, gen_valid, nb_train, nb_valid, class_weights = \
+                train_gen_builder.get_train_valid_generators(batch_size=self.batch_size,
+                                                             valid_ratio=self.valid_ratio)
 
-        print("Train dataset size: {} | Validation dataset size: {}".format(nb_train, nb_valid))
+            print("Train dataset size: {} | Validation dataset size: {}".format(nb_train, nb_valid))
 
-        self._compile_model(self.model, lr=0.01)
-        # self.model.summary()
+            self._compile_model(model, lr=self.learning_rates[i])
 
-        self.model.fit_generator(
-            gen_train,
-            steps_per_epoch=get_nb_minibatches(nb_train, batch_size),
-            epochs=n_epochs,
-            max_queue_size=batch_size * 2,
-            callbacks=get_callbacks(self.model, self.logs_path),
-            class_weight=None,
-            validation_data=gen_valid,
-            validation_steps=get_nb_minibatches(nb_valid, batch_size) if nb_valid is not None else None,
-            verbose=1)
+            model.fit_generator(
+                gen_train,
+                steps_per_epoch=get_nb_minibatches(nb_train, self.batch_size),
+                epochs=self.n_epochs,
+                max_queue_size=self.batch_size * 2,
+                callbacks=get_callbacks(model, self.logs_path),
+                class_weight=None,
+                validation_data=gen_valid,
+                validation_steps=get_nb_minibatches(nb_valid, self.batch_size) if nb_valid is not None else None,
+                verbose=1)
+
+    def _predict_first_level(self, img_loader):
+        y_probas_1lvl = np.zeros((len(img_loader), img_loader.n_classes * len(self.models)))
 
         # Load best trained model:
-        load_pretrained_model(self.model, self.logs_path)
+        for i, (model, preproc_fns) in enumerate(zip(self.models, self.preprocessing_fns)):
+            load_pretrained_model(model, self.logs_path)
+
+            test_gen_builder = BatchGeneratorBuilder(img_loader,
+                                                     shuffle=False,
+                                                     transform_img=preproc_fns[0],
+                                                     transform_test_img=preproc_fns[1],
+                                                     chunk_size=self.batch_size * 2,
+                                                     n_jobs=N_JOBS)
+
+            # Perform TTA:
+            y_proba = np.zeros((self.n_tta, test_gen_builder.nb_examples, img_loader.n_classes))
+            for j in range(self.n_tta):
+                print("- TTA round: %i / %i" % (j + 1, self.n_tta))
+                test_gen, nb_test = test_gen_builder.get_test_generator(batch_size=self.batch_size)
+                y_proba[j, :, :] = model.predict_generator(test_gen,
+                                                           steps=get_nb_minibatches(nb_test, self.batch_size),
+                                                           max_queue_size=self.batch_size * 2,
+                                                           verbose=1)
+            y_proba = np.mean(y_proba, axis=0)
+            y_probas_1lvl[:, 403 * i:(i + 1) * 403] = y_proba
+
+        return y_probas_1lvl
+
+    def _compute_topk(self, y_probas_1lvl, k):
+        y_topk_preds = np.zeros((len(y_probas_1lvl), len(self.models) * k))
+        for i in range(len(self.models)):
+            y_topk_preds[:, i * k:(i + 1) * k] = np.argsort(y_probas_1lvl[:, 403 * i:(i + 1) * 403],
+                                                            axis=1)[:, ::-1][:, :k]
+        return y_topk_preds.astype(np.int)
+
+    def fit(self, img_loader):
+        self._train_first_level(img_loader)
+
+        first_level_probas_filename = os.path.join(self.logs_path, "y_probas_1lvl.npz")
+        if not os.path.exists(first_level_probas_filename):
+            y_probas_1lvl = self._predict_first_level(img_loader)
+            # Save 1st level probas:
+            np.savez_compressed(first_level_probas_filename, y_probas_1lvl=y_probas_1lvl)
+        else:
+            print("Load y_probas_1lvl from %s" % first_level_probas_filename)
+            y_probas_1lvl = np.load(first_level_probas_filename)['y_probas_1lvl']
+
+        # First level mean f_beta score:
+        y_true = img_loader.y_array
+        y_probas_1lvl_mean = np.mean(y_probas_1lvl.reshape((len(y_probas_1lvl),
+                                                            len(self.models),
+                                                            img_loader.n_classes)), axis=1)
+        res = accuracy_score(y_true, np.argmax(y_probas_1lvl_mean, axis=1))
+        print("\nAccuracy from mean first level predictons: {}".format(res))
 
     def predict_proba(self, img_loader):
-
-        batch_size = 32
-        test_gen_builder = BatchGeneratorBuilder(img_loader,
-                                                 shuffle=False,
-                                                 chunk_size=batch_size * 2,
-                                                 n_jobs=N_JOBS)
-        # Perform TTA:
-        n = 10
-        y_probas = np.zeros((n, test_gen_builder.nb_examples, img_loader.n_classes))
-        for i in range(n):
-            print("- TTA round: %i" % i)
-            test_gen, nb_test = test_gen_builder.get_test_generator(batch_size=batch_size)
-            y_probas[i, :, :] = self.model.predict_generator(test_gen,
-                                                             steps=get_nb_minibatches(nb_test, batch_size),
-                                                             max_queue_size=batch_size * 2,
-                                                             verbose=1)
-        y_probas = np.mean(y_probas, axis=0)
-        return y_probas
+        y_probas_1lvl = self._predict_first_level(img_loader)
+        y_probas_1lvl_mean = np.mean(y_probas_1lvl.reshape((len(y_probas_1lvl),
+                                                            len(self.models),
+                                                            img_loader.n_classes)), axis=1)
+        return y_probas_1lvl_mean
 
     def _compile_model(self, model, lr):
         loss = categorical_crossentropy
         model.compile(
-            loss=loss, optimizer=Adam(lr=lr),
+            loss=loss,
+            optimizer=Adam(lr=lr),
             metrics=['accuracy', f170])
 
-    def _build_model(self):
+    def _build_models(self):
 
-        # Make ensemble of the best pretrained models :
-        # - Inception-ResNetV2
-        m1 = InceptionResNetV2(input_shape=(451, 451, 3), include_top=False, weights=None)
-        x1 = m1.outputs[0]
-        # Classification block
-        x1 = GlobalAveragePooling2D(name='avg_pool1')(x1)
-        out1 = Dense(403, activation='softmax', name='predictions_m1')(x1)
+        pretrained_models = [
+            InceptionResNetV2(input_shape=SIZE + (3, ), include_top=False, weights='imagenet'),
+            ResNet50(input_shape=SIZE + (3, ), include_top=False, weights='imagenet'),
+            Xception(input_shape=SIZE + (3, ), include_top=False, weights='imagenet'),
+            DenseNetImageNet161(input_shape=SIZE + (3, ), include_top=False, weights='imagenet'),
+        ]
 
-        model1 = Model(m1.inputs, out1)
-        model1.name = "InceptionResNetV2-451x451"
-        weights_filename = 'InceptionResNetV2_best_val_loss.h5'
-        weights_path = get_file(weights_filename,
-                                BASE_WEIGHT_URL + weights_filename,
-                                cache_subdir='models')
-        model1.load_weights(weights_path)
-        for l in model1.layers:
-            l.trainable = False
+        self.preprocessing_fns = [
+            (_transform_fn_irv2, _transform_test_fn_irv2),
+            (_transform_fn_resnet, _transform_test_fn_resnet),
+            (_transform_fn_xception, _transform_test_fn_xception),
+            (_transform_fn_densenet, _transform_test_fn_densenet),
+        ]
 
-        # - DenseNet161
-        m2 = DenseNetImageNet161(input_shape=(452, 452, 3), include_top=False, weights=None)
-        x2 = m2.outputs[0]
-        # Classification block
-        x2 = GlobalAveragePooling2D(name='avg_pool2')(x2)
-        out2 = Dense(403, activation='softmax', name='predictions_m2')(x2)
-
-        model2 = Model(m2.inputs, out2)
-        model2.name = "DenseNet161-452x452"
-        weights_filename = 'DenseNet161_best_val_loss.h5'
-        weights_path = get_file(weights_filename,
-                                BASE_WEIGHT_URL + weights_filename,
-                                cache_subdir='models')
-        model2.load_weights(weights_path)
-        for l in model2.layers:
-            l.trainable = False
-
-        # Final classification layer:
-        merge_layer = Concatenate()([model1.outputs[0], model2.outputs[0]])
-        out = Dense(403, activation='softmax', name='final_predictions')(merge_layer)
-
-        model = Model([model1.inputs[0], model2.inputs[0]], out)
-        model.name = "Ensemble_0"
-        return model
+        self.models = []
+        for model in pretrained_models:
+            x = model.outputs[0]
+            # Classification block
+            x = GlobalAveragePooling2D(name='avg_pool_%s' % model.name)(x)
+            out = Dense(403, activation='softmax', name='predictions_%s' % model.name)(x)
+            new_model = Model(model.inputs[0], out)
+            new_model.name = model.name + "_PI3"
+            self.models.append(new_model)
 
 
 # ================================================================================================================
@@ -181,7 +211,7 @@ def get_callbacks(model, logs_path):
     callbacks.append(onplateau)
 
     # LR schedule: step decay
-    step_decay_f = lambda epoch: step_decay(epoch, model=model, base=1.3, period=3, verbose=True)
+    step_decay_f = lambda epoch: step_decay(epoch, model=model, base=1.25, period=1, verbose=True)
     lrscheduler = LearningRateScheduler(step_decay_f)
     callbacks.append(lrscheduler)
 
@@ -201,13 +231,10 @@ def get_callbacks(model, logs_path):
 
     # Some other callback on local testing
     if 'LOCAL_TESTING' in os.environ:
-        from keras.callbacks import TensorBoard, CSVLogger
+        from keras.callbacks import CSVLogger
 
         csv_logger = CSVLogger(os.path.join(weights_path, 'training_%s.log' % save_prefix))
         callbacks.append(csv_logger)
-
-        tboard = TensorBoard('logs', write_grads=True)
-        callbacks.append(tboard)
 
     return callbacks
 
@@ -246,6 +273,7 @@ def f170(y_true, y_pred):
 def load_pretrained_model(model, logs_path):
     best_weights_filename = os.path.join(logs_path, "weights", "%s_best_val_loss.h5" % model.name)
     print("Load best loss weights: ", best_weights_filename)
+    assert os.path.exists(best_weights_filename)
     model.load_weights(best_weights_filename)
 
 
@@ -272,25 +300,11 @@ def _imread_transform(filename, fn):
     return fn(img)
 
 
-def _transform_fn_451(x):
-    return _transform_fn(x, size=(451, 451), preprocess_input_fn=tf_preprocess_input)
-
-
-def _transform_fn_452(x):
-    return _transform_fn(x, size=(452, 452), preprocess_input_fn=densenet_preprocess_input)
-
-
-def _transform_test_fn_451(x):
-    return _transform_test_fn(x, size=(451, 451), preprocess_input_fn=tf_preprocess_input)
-
-
-def _transform_test_fn_452(x):
-    return _transform_test_fn(x, size=(452, 452), preprocess_input_fn=densenet_preprocess_input)
-
-
 class BatchGeneratorBuilder(object):
 
     def __init__(self, img_loader,
+                 transform_img,
+                 transform_test_img,
                  shuffle,
                  chunk_size,
                  n_jobs):
@@ -300,10 +314,13 @@ class BatchGeneratorBuilder(object):
         self.folder = img_loader.folder
 
         self.y_array = img_loader.y_array
-        self.n_classes = len(np.unique(self.y_array)) if self.y_array is not None else None
+        self.n_classes = img_loader.n_classes
 
         self.chunk_size = chunk_size
         self.n_jobs = n_jobs
+
+        self.transform_img = transform_img
+        self.transform_test_img = transform_test_img
 
         self.shuffle = shuffle
 
@@ -342,20 +359,11 @@ class BatchGeneratorBuilder(object):
             nb_train = len(train_indices)
             nb_valid = len(valid_indices)
 
-            gen_train = self._get_generator(indices=train_indices,
-                                            batch_size=batch_size,
-                                            transform_fn=[_transform_fn_451,
-                                                          _transform_fn_452])
-            gen_valid = self._get_generator(indices=valid_indices,
-                                            batch_size=batch_size,
-                                            transform_fn=[_transform_test_fn_451,
-                                                          _transform_test_fn_452])
+            gen_train = self._get_generator(self.transform_img, indices=train_indices, batch_size=batch_size)
+            gen_valid = self._get_generator(self.transform_test_img, indices=valid_indices, batch_size=batch_size)
         else:
             train_indices = np.arange(self.nb_examples)
-            gen_train = self._get_generator(indices=train_indices,
-                                            batch_size=batch_size,
-                                            transform_fn=[_transform_fn_451,
-                                                          _transform_fn_452])
+            gen_train = self._get_generator(self.transform_img, indices=train_indices, batch_size=batch_size)
             nb_train = len(train_indices)
             gen_valid = None
             nb_valid = None
@@ -374,22 +382,17 @@ class BatchGeneratorBuilder(object):
 
     def get_test_generator(self, batch_size=32):
         test_indices = np.arange(self.nb_examples)
-        gen_test = self._get_generator(indices=test_indices,
-                                       batch_size=batch_size,
-                                       transform_fn=[_transform_test_fn_451,
-                                                     _transform_test_fn_452])
+        gen_test = self._get_generator(transform_fn=self.transform_test_img,
+                                       indices=test_indices,
+                                       is_infinite=False,
+                                       batch_size=batch_size)
         nb_test = len(test_indices)
         return gen_test, nb_test
 
-    def _get_generator(self, transform_fn, indices, batch_size=32):
+    def _get_generator(self, transform_fn, indices, is_infinite=True, batch_size=32):
 
         assert transform_fn is not None
         assert indices is not None
-
-        assert isinstance(transform_fn, list)
-        if isinstance(transform_fn, list):
-            for fn in transform_fn:
-                assert callable(fn)
 
         np.random.seed(SEED)
         chunk_size = self.chunk_size
@@ -407,14 +410,12 @@ class BatchGeneratorBuilder(object):
                 for i in range(0, len(X_array), chunk_size):
                     X_chunk = X_array[i:i + chunk_size]
 
-                    if len(X_chunk) < chunk_size and y_array is not None:
+                    if len(X_chunk) < chunk_size and is_infinite:
                         continue
 
                     filenames = [os.path.join(folder, '{}'.format(x)) for x in X_chunk]
-                    X = []
-                    for fn in transform_fn:
-                        res = parallel(delayed(_imread_transform)(filename, fn) for filename in filenames)
-                        X.append(np.array(res))
+
+                    X = np.array(parallel(delayed(_imread_transform)(filename, transform_fn) for filename in filenames))
 
                     if y_array is not None:
                         y = y_array[i:i + chunk_size]
@@ -424,19 +425,18 @@ class BatchGeneratorBuilder(object):
                         y = None
 
                     # 2) Yielding mini-batches
-                    ll = len(X)
                     for j in range(0, chunk_size, batch_size):
-                        batch_x = [X[k][j:j + batch_size] for k in range(ll)] if ll > 1 else X[0][j:j + batch_size]
                         if y is not None:
-                            yield batch_x, y[j:j + batch_size]
+                            yield X[j:j + batch_size], y[j:j + batch_size]
                         else:
-                            yield batch_x
+                            yield X[j:j + batch_size]
+
                 # Exit if test mode
-                if y_array is None:
+                if not is_infinite:
                     return
 
 
-def _to_categorical(y, num_classes=None):
+def _to_categorical(y, num_classes=403):
     """Convert a class vector (integers) to binary class matrix.
 
     Taken from keras:
@@ -453,8 +453,6 @@ def _to_categorical(y, num_classes=None):
         A binary matrix representation of the input.
     """
     y = np.array(y, dtype='int').ravel()
-    if not num_classes:
-        num_classes = np.max(y) + 1
     n = y.shape[0]
     categorical = np.zeros((n, num_classes))
     categorical[np.arange(n), y] = 1
@@ -480,10 +478,10 @@ train_geom_aug = iaa.Sequential([
     iaa.Fliplr(0.5),
     iaa.Flipud(0.5),
     iaa.Sometimes(0.5, (iaa.Affine(
-        scale={"x": (0.8, 1.2), "y": (0.8, 1.2)},
-        translate_percent={"x": (-0.2, 0.2), "y": (-0.2, 0.2)},
+        scale={"x": (0.85, 1.15), "y": (0.85, 1.15)},
+        translate_percent={"x": (-0.12, 0.12), "y": (-0.12, 0.12)},
         rotate=(-45, 45),
-        shear=(-5, 5),
+        shear=(-2, 2),
         order=3,
         mode='edge'
     ))),
@@ -493,28 +491,30 @@ train_color_aug = iaa.Sequential([
     iaa.OneOf([
         iaa.Add((-10, 10), per_channel=0.5),  # change brightness of images (by -10 to 10 of original value)
         iaa.ContrastNormalization((0.5, 2.0), per_channel=0.5),  # improve or worsen the contrast
+    ]),
+])
+
+test_geom_aug = iaa.Sequential([
+    iaa.OneOf([
+        iaa.Fliplr(1.0),
+        iaa.Flipud(1.0),
+        iaa.Affine(
+            translate_percent={"x": (-0.12, 0.12), "y": (-0.12, 0.12)},
+            rotate=(-45, 45),
+            order=3,
+            mode='edge'
+        ),
     ])
 
 ])
 
-test_geom_aug = iaa.Sequential([
-    iaa.Fliplr(0.5),
-    iaa.Flipud(0.5),
-])
-
-# test_color_aug = iaa.Sequential([
-#     iaa.OneOf([
-#         iaa.Add((-25, 25), per_channel=0.5),  # change brightness of images (by -10 to 10 of original value)
-#         iaa.ContrastNormalization((0.5, 2.0), per_channel=0.5),  # improve or worsen the contrast
-#         iaa.AddToHueAndSaturation((-20, 20)),  # change hue and saturation
-#     ])
-# ])
 test_color_aug = None
 
 
 def _transform(x, size, preprocess_input_fn, geom_aug=None, color_aug=None):
 
     # Resize to SIZE
+    x = cv2.resize(x, dsize=(size[1]*2, size[0]*2), interpolation=cv2.INTER_NEAREST)
     x = cv2.resize(x, dsize=size[::-1], interpolation=cv2.INTER_CUBIC)
     # Data augmentation:
     if geom_aug is not None:
@@ -529,8 +529,40 @@ def _transform(x, size, preprocess_input_fn, geom_aug=None, color_aug=None):
 
 
 def _transform_fn(x, size, preprocess_input_fn):
-    return _transform(x, size, preprocess_input_fn, train_geom_aug, None)
+    return _transform(x, size, preprocess_input_fn, train_geom_aug, train_color_aug)
 
 
 def _transform_test_fn(x, size, preprocess_input_fn):
     return _transform(x, size, preprocess_input_fn, test_geom_aug, test_color_aug)
+
+
+def _transform_fn_irv2(x):
+    return _transform_fn(x, size=SIZE, preprocess_input_fn=irv2_preprocess_input)
+
+
+def _transform_fn_resnet(x):
+    return _transform_fn(x, size=SIZE, preprocess_input_fn=resnet_preprocess_input)
+
+
+def _transform_fn_xception(x):
+    return _transform_fn(x, size=SIZE, preprocess_input_fn=xception_preprocess_input)
+
+
+def _transform_fn_densenet(x):
+    return _transform_fn(x, size=SIZE, preprocess_input_fn=densenet_preprocess_input)
+
+
+def _transform_test_fn_irv2(x):
+    return _transform_test_fn(x, size=SIZE, preprocess_input_fn=irv2_preprocess_input)
+
+
+def _transform_test_fn_resnet(x):
+    return _transform_test_fn(x, size=SIZE, preprocess_input_fn=resnet_preprocess_input)
+
+
+def _transform_test_fn_xception(x):
+    return _transform_test_fn(x, size=SIZE, preprocess_input_fn=xception_preprocess_input)
+
+
+def _transform_test_fn_densenet(x):
+    return _transform_test_fn(x, size=SIZE, preprocess_input_fn=densenet_preprocess_input)

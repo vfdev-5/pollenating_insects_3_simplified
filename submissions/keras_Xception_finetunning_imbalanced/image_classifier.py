@@ -15,6 +15,8 @@ from keras.layers import Dense, Dropout, GlobalAveragePooling2D
 from keras.losses import categorical_crossentropy
 from keras.models import Model
 from keras.optimizers import Adam
+from keras.utils.data_utils import get_file
+
 from skimage.io import imread as skimage_imread
 from sklearn.model_selection import StratifiedShuffleSplit
 
@@ -25,9 +27,16 @@ SEED = 123456789
 N_JOBS = 15
 
 
+BASE_WEIGHT_URL = 'https://github.com/vfdev-5/pollenating_insects_3_simplified/releases/download/v0.1/'
+
+
 class ImageClassifier(object):
     def __init__(self):
         self.model = self._build_model()
+
+        self.n_epochs = 10
+        self.batch_size = 8
+        self.n_tta = 10
 
         if 'LOGS_PATH' in os.environ:
             self.logs_path = os.environ['LOGS_PATH']
@@ -37,47 +46,13 @@ class ImageClassifier(object):
 
     def fit(self, img_loader):
 
-        batch_size = 16
-        valid_ratio = 0.1
-        n_epochs = 10
+        weights_filename = 'Xception_best_val_loss.h5'
+        weights_path = get_file(weights_filename,
+                                BASE_WEIGHT_URL + weights_filename,
+                                cache_subdir='models')
 
-        if 'LOCAL_TESTING' in os.environ:
-            print("\n\n------------------------------")
-            print("-------- LOCAL TESTING -------")
-            print("------------------------------\n\n")
-            if 'LOAD_BEST_MODEL' in os.environ:
-                load_pretrained_model(self.model, self.logs_path)
-                return
-
-        train_gen_builder = BatchGeneratorBuilder(img_loader,
-                                                  transform_img=_transform_fn,
-                                                  transform_test_img=_transform_test_fn,
-                                                  shuffle=True,
-                                                  chunk_size=batch_size * 20,
-                                                  n_jobs=N_JOBS)
-
-        gen_train, gen_valid, nb_train, nb_valid, class_weights = \
-            train_gen_builder.get_train_valid_generators(batch_size=batch_size,
-                                                         valid_ratio=valid_ratio)
-
-        print("Train dataset size: {} | Validation dataset size: {}".format(nb_train, nb_valid))
-
-        self._compile_model(self.model, lr=0.000123)
-        self.model.summary()
-
-        self.model.fit_generator(
-            gen_train,
-            steps_per_epoch=get_nb_minibatches(nb_train, batch_size),
-            epochs=n_epochs,
-            max_queue_size=batch_size * 5,
-            callbacks=get_callbacks(self.model, self.logs_path),
-            class_weight=None,
-            validation_data=gen_valid,
-            validation_steps=get_nb_minibatches(nb_valid, batch_size) if nb_valid is not None else None,
-            verbose=1)
-
-        # Load best trained model:
-        load_pretrained_model(self.model, self.logs_path)
+        print("Load best loss weights: ", weights_path)
+        self.model.load_weights(weights_path)
 
     def predict_proba(self, img_loader):
 
@@ -89,10 +64,9 @@ class ImageClassifier(object):
                                                  chunk_size=batch_size * 20,
                                                  n_jobs=N_JOBS)
         # Perform TTA:
-        n = 7
-        y_probas = np.zeros((n, test_gen_builder.nb_examples, img_loader.n_classes))
-        for i in range(n):
-            print("- TTA round: %i" % i)
+        y_probas = np.zeros((self.n_tta, test_gen_builder.nb_examples, img_loader.n_classes))
+        for i in range(self.n_tta):
+            print("- TTA round: %i / %i" % (i + 1, self.n_tta))
             test_gen, nb_test = test_gen_builder.get_test_generator(batch_size=batch_size)
             y_probas[i, :, :] = self.model.predict_generator(test_gen,
                                                              steps=get_nb_minibatches(nb_test, batch_size),

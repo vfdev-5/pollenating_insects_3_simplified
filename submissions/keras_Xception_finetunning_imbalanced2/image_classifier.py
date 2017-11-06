@@ -1,44 +1,38 @@
 from __future__ import print_function
 
 import os
+from collections import defaultdict
 from datetime import datetime
 
-from sklearn.model_selection import StratifiedShuffleSplit
-
-from joblib import delayed
-from joblib import Parallel
-
-import numpy as np
 import cv2
-
-from skimage.io import imread as skimage_imread
-
+import numpy as np
+from joblib import Parallel
+from joblib import delayed
 from keras import backend as K
-from keras.models import Model
-from keras.layers import Dense, GlobalAveragePooling2D, Concatenate
-from keras.optimizers import Adam
+from keras.applications.xception import Xception, preprocess_input
 from keras.callbacks import ReduceLROnPlateau, ModelCheckpoint, LearningRateScheduler
+from keras.layers import Dense, Dropout, GlobalAveragePooling2D
 from keras.losses import categorical_crossentropy
-
-from keras.applications.inception_resnet_v2 import InceptionResNetV2
-from keras_contrib.applications.densenet import DenseNetImageNet161
-from keras.utils.data_utils import get_file
-
-from keras_contrib.applications.densenet import preprocess_input as densenet_preprocess_input
-from keras.applications.inception_resnet_v2 import preprocess_input as tf_preprocess_input
-
+from keras.models import Model
+from keras.optimizers import Adam
+from skimage.io import imread as skimage_imread
+from sklearn.model_selection import StratifiedShuffleSplit
 
 SUBMIT_NAME = os.path.basename(os.path.dirname(__file__))
 
+SIZE = (299, 299)
 SEED = 123456789
-N_JOBS = 10
-
-BASE_WEIGHT_URL = 'https://github.com/vfdev-5/pollenating_insects_3/releases/download/v1.0/'
+N_JOBS = 15
 
 
 class ImageClassifier(object):
     def __init__(self):
         self.model = self._build_model()
+
+        self.n_epochs = 10
+        self.batch_size = 8
+        self.valid_ratio = 0.1
+        self.n_tta = 10
 
         if 'LOGS_PATH' in os.environ:
             self.logs_path = os.environ['LOGS_PATH']
@@ -48,41 +42,39 @@ class ImageClassifier(object):
 
     def fit(self, img_loader):
 
-        batch_size = 32
-        valid_ratio = 0.2
-        n_epochs = 3
-
         if 'LOCAL_TESTING' in os.environ:
             print("\n\n------------------------------")
             print("-------- LOCAL TESTING -------")
             print("------------------------------\n\n")
             if 'LOAD_BEST_MODEL' in os.environ:
                 load_pretrained_model(self.model, self.logs_path)
-                # return
+                return
 
         train_gen_builder = BatchGeneratorBuilder(img_loader,
+                                                  transform_img=_transform_fn,
+                                                  transform_test_img=_transform_test_fn,
                                                   shuffle=True,
-                                                  chunk_size=batch_size * 2,
+                                                  chunk_size=self.batch_size * 20,
                                                   n_jobs=N_JOBS)
 
         gen_train, gen_valid, nb_train, nb_valid, class_weights = \
-            train_gen_builder.get_train_valid_generators(batch_size=batch_size,
-                                                         valid_ratio=valid_ratio)
+            train_gen_builder.get_train_valid_generators(batch_size=self.batch_size,
+                                                         valid_ratio=self.valid_ratio)
 
         print("Train dataset size: {} | Validation dataset size: {}".format(nb_train, nb_valid))
 
-        self._compile_model(self.model, lr=0.01)
-        # self.model.summary()
+        self._compile_model(self.model, lr=0.000345)
+        self.model.summary()
 
         self.model.fit_generator(
             gen_train,
-            steps_per_epoch=get_nb_minibatches(nb_train, batch_size),
-            epochs=n_epochs,
-            max_queue_size=batch_size * 2,
+            steps_per_epoch=get_nb_minibatches(nb_train, self.batch_size),
+            epochs=self.n_epochs,
+            max_queue_size=self.batch_size * 5,
             callbacks=get_callbacks(self.model, self.logs_path),
             class_weight=None,
             validation_data=gen_valid,
-            validation_steps=get_nb_minibatches(nb_valid, batch_size) if nb_valid is not None else None,
+            validation_steps=get_nb_minibatches(nb_valid, self.batch_size) if nb_valid is not None else None,
             verbose=1)
 
         # Load best trained model:
@@ -92,18 +84,19 @@ class ImageClassifier(object):
 
         batch_size = 32
         test_gen_builder = BatchGeneratorBuilder(img_loader,
+                                                 transform_img=_transform_fn,
+                                                 transform_test_img=_transform_test_fn,
                                                  shuffle=False,
-                                                 chunk_size=batch_size * 2,
+                                                 chunk_size=batch_size * 20,
                                                  n_jobs=N_JOBS)
         # Perform TTA:
-        n = 10
-        y_probas = np.zeros((n, test_gen_builder.nb_examples, img_loader.n_classes))
-        for i in range(n):
-            print("- TTA round: %i" % i)
+        y_probas = np.zeros((self.n_tta, test_gen_builder.nb_examples, img_loader.n_classes))
+        for i in range(self.n_tta):
+            print("- TTA round: %i / %i" % (i + 1, self.n_tta))
             test_gen, nb_test = test_gen_builder.get_test_generator(batch_size=batch_size)
             y_probas[i, :, :] = self.model.predict_generator(test_gen,
                                                              steps=get_nb_minibatches(nb_test, batch_size),
-                                                             max_queue_size=batch_size * 2,
+                                                             max_queue_size=batch_size * 5,
                                                              verbose=1)
         y_probas = np.mean(y_probas, axis=0)
         return y_probas
@@ -115,48 +108,15 @@ class ImageClassifier(object):
             metrics=['accuracy', f170])
 
     def _build_model(self):
-
-        # Make ensemble of the best pretrained models :
-        # - Inception-ResNetV2
-        m1 = InceptionResNetV2(input_shape=(451, 451, 3), include_top=False, weights=None)
-        x1 = m1.outputs[0]
+        xception = Xception(input_shape=SIZE + (3,), include_top=False, weights='imagenet')
+        x = xception.outputs[0]
         # Classification block
-        x1 = GlobalAveragePooling2D(name='avg_pool1')(x1)
-        out1 = Dense(403, activation='softmax', name='predictions_m1')(x1)
+        x = GlobalAveragePooling2D(name='avg_pool')(x)
+        x = Dropout(0.5)(x)
+        out = Dense(403, activation='softmax', name='predictions')(x)
 
-        model1 = Model(m1.inputs, out1)
-        model1.name = "InceptionResNetV2-451x451"
-        weights_filename = 'InceptionResNetV2_best_val_loss.h5'
-        weights_path = get_file(weights_filename,
-                                BASE_WEIGHT_URL + weights_filename,
-                                cache_subdir='models')
-        model1.load_weights(weights_path)
-        for l in model1.layers:
-            l.trainable = False
-
-        # - DenseNet161
-        m2 = DenseNetImageNet161(input_shape=(452, 452, 3), include_top=False, weights=None)
-        x2 = m2.outputs[0]
-        # Classification block
-        x2 = GlobalAveragePooling2D(name='avg_pool2')(x2)
-        out2 = Dense(403, activation='softmax', name='predictions_m2')(x2)
-
-        model2 = Model(m2.inputs, out2)
-        model2.name = "DenseNet161-452x452"
-        weights_filename = 'DenseNet161_best_val_loss.h5'
-        weights_path = get_file(weights_filename,
-                                BASE_WEIGHT_URL + weights_filename,
-                                cache_subdir='models')
-        model2.load_weights(weights_path)
-        for l in model2.layers:
-            l.trainable = False
-
-        # Final classification layer:
-        merge_layer = Concatenate()([model1.outputs[0], model2.outputs[0]])
-        out = Dense(403, activation='softmax', name='final_predictions')(merge_layer)
-
-        model = Model([model1.inputs[0], model2.inputs[0]], out)
-        model.name = "Ensemble_0"
+        model = Model(xception.inputs, out)
+        model.name = "Xception"
         return model
 
 
@@ -201,13 +161,10 @@ def get_callbacks(model, logs_path):
 
     # Some other callback on local testing
     if 'LOCAL_TESTING' in os.environ:
-        from keras.callbacks import TensorBoard, CSVLogger
+        from keras.callbacks import CSVLogger
 
         csv_logger = CSVLogger(os.path.join(weights_path, 'training_%s.log' % save_prefix))
         callbacks.append(csv_logger)
-
-        tboard = TensorBoard('logs', write_grads=True)
-        callbacks.append(tboard)
 
     return callbacks
 
@@ -272,25 +229,11 @@ def _imread_transform(filename, fn):
     return fn(img)
 
 
-def _transform_fn_451(x):
-    return _transform_fn(x, size=(451, 451), preprocess_input_fn=tf_preprocess_input)
-
-
-def _transform_fn_452(x):
-    return _transform_fn(x, size=(452, 452), preprocess_input_fn=densenet_preprocess_input)
-
-
-def _transform_test_fn_451(x):
-    return _transform_test_fn(x, size=(451, 451), preprocess_input_fn=tf_preprocess_input)
-
-
-def _transform_test_fn_452(x):
-    return _transform_test_fn(x, size=(452, 452), preprocess_input_fn=densenet_preprocess_input)
-
-
 class BatchGeneratorBuilder(object):
 
     def __init__(self, img_loader,
+                 transform_img,
+                 transform_test_img,
                  shuffle,
                  chunk_size,
                  n_jobs):
@@ -304,6 +247,9 @@ class BatchGeneratorBuilder(object):
 
         self.chunk_size = chunk_size
         self.n_jobs = n_jobs
+
+        self.transform_img = transform_img
+        self.transform_test_img = transform_test_img
 
         self.shuffle = shuffle
 
@@ -342,42 +288,31 @@ class BatchGeneratorBuilder(object):
             nb_train = len(train_indices)
             nb_valid = len(valid_indices)
 
-            gen_train = self._get_generator(indices=train_indices,
-                                            batch_size=batch_size,
-                                            transform_fn=[_transform_fn_451,
-                                                          _transform_fn_452])
-            gen_valid = self._get_generator(indices=valid_indices,
-                                            batch_size=batch_size,
-                                            transform_fn=[_transform_test_fn_451,
-                                                          _transform_test_fn_452])
+            gen_train = self._get_generator(self.transform_img, indices=train_indices, batch_size=batch_size)
+            gen_valid = self._get_generator(self.transform_test_img, indices=valid_indices, batch_size=batch_size)
         else:
             train_indices = np.arange(self.nb_examples)
-            gen_train = self._get_generator(indices=train_indices,
-                                            batch_size=batch_size,
-                                            transform_fn=[_transform_fn_451,
-                                                          _transform_fn_452])
+            gen_train = self._get_generator(self.transform_img, indices=train_indices, batch_size=batch_size)
             nb_train = len(train_indices)
             gen_valid = None
             nb_valid = None
 
-        class_weights = None
-        # class_weights = defaultdict(int)
-        # max_count = 0
-        # for class_index in self.y_array[train_indices]:
-        #     class_weights[class_index] += 1
-        #     if class_weights[class_index] > max_count:
-        #         max_count = class_weights[class_index]
-        # for class_index in class_weights:
-        #     class_weights[class_index] = np.log(1.0 + (max_count / class_weights[class_index]) ** 2)
+        class_weights = defaultdict(int)
+        max_count = 0
+        for class_index in self.y_array[train_indices]:
+            class_weights[class_index] += 1
+            if class_weights[class_index] > max_count:
+                max_count = class_weights[class_index]
+        for class_index in class_weights:
+            class_weights[class_index] = np.log(1.0 + (max_count / class_weights[class_index]) ** 2)
 
         return gen_train, gen_valid, nb_train, nb_valid, class_weights
 
     def get_test_generator(self, batch_size=32):
         test_indices = np.arange(self.nb_examples)
-        gen_test = self._get_generator(indices=test_indices,
-                                       batch_size=batch_size,
-                                       transform_fn=[_transform_test_fn_451,
-                                                     _transform_test_fn_452])
+        gen_test = self._get_generator(transform_fn=self.transform_test_img,
+                                       indices=test_indices,
+                                       batch_size=batch_size)
         nb_test = len(test_indices)
         return gen_test, nb_test
 
@@ -385,11 +320,6 @@ class BatchGeneratorBuilder(object):
 
         assert transform_fn is not None
         assert indices is not None
-
-        assert isinstance(transform_fn, list)
-        if isinstance(transform_fn, list):
-            for fn in transform_fn:
-                assert callable(fn)
 
         np.random.seed(SEED)
         chunk_size = self.chunk_size
@@ -411,10 +341,8 @@ class BatchGeneratorBuilder(object):
                         continue
 
                     filenames = [os.path.join(folder, '{}'.format(x)) for x in X_chunk]
-                    X = []
-                    for fn in transform_fn:
-                        res = parallel(delayed(_imread_transform)(filename, fn) for filename in filenames)
-                        X.append(np.array(res))
+
+                    X = np.array(parallel(delayed(_imread_transform)(filename, transform_fn) for filename in filenames))
 
                     if y_array is not None:
                         y = y_array[i:i + chunk_size]
@@ -424,13 +352,12 @@ class BatchGeneratorBuilder(object):
                         y = None
 
                     # 2) Yielding mini-batches
-                    ll = len(X)
                     for j in range(0, chunk_size, batch_size):
-                        batch_x = [X[k][j:j + batch_size] for k in range(ll)] if ll > 1 else X[0][j:j + batch_size]
                         if y is not None:
-                            yield batch_x, y[j:j + batch_size]
+                            yield X[j:j + batch_size], y[j:j + batch_size]
                         else:
-                            yield batch_x
+                            yield X[j:j + batch_size]
+
                 # Exit if test mode
                 if y_array is None:
                     return
@@ -480,10 +407,10 @@ train_geom_aug = iaa.Sequential([
     iaa.Fliplr(0.5),
     iaa.Flipud(0.5),
     iaa.Sometimes(0.5, (iaa.Affine(
-        scale={"x": (0.8, 1.2), "y": (0.8, 1.2)},
-        translate_percent={"x": (-0.2, 0.2), "y": (-0.2, 0.2)},
+        scale={"x": (0.85, 1.15), "y": (0.85, 1.15)},
+        translate_percent={"x": (-0.12, 0.12), "y": (-0.12, 0.12)},
         rotate=(-45, 45),
-        shear=(-5, 5),
+        shear=(-2, 2),
         order=3,
         mode='edge'
     ))),
@@ -493,13 +420,21 @@ train_color_aug = iaa.Sequential([
     iaa.OneOf([
         iaa.Add((-10, 10), per_channel=0.5),  # change brightness of images (by -10 to 10 of original value)
         iaa.ContrastNormalization((0.5, 2.0), per_channel=0.5),  # improve or worsen the contrast
-    ])
-
+    ]),
 ])
 
 test_geom_aug = iaa.Sequential([
-    iaa.Fliplr(0.5),
-    iaa.Flipud(0.5),
+    iaa.OneOf([
+        iaa.Fliplr(1.0),
+        iaa.Flipud(1.0),
+        iaa.Affine(
+            translate_percent={"x": (-0.12, 0.12), "y": (-0.12, 0.12)},
+            rotate=(-45, 45),
+            order=3,
+            mode='edge'
+        ),
+    ])
+
 ])
 
 # test_color_aug = iaa.Sequential([
@@ -512,10 +447,11 @@ test_geom_aug = iaa.Sequential([
 test_color_aug = None
 
 
-def _transform(x, size, preprocess_input_fn, geom_aug=None, color_aug=None):
+def _transform(x, geom_aug=None, color_aug=None):
 
     # Resize to SIZE
-    x = cv2.resize(x, dsize=size[::-1], interpolation=cv2.INTER_CUBIC)
+    x = cv2.resize(x, dsize=(SIZE[1]*2, SIZE[0]*2), interpolation=cv2.INTER_NEAREST)
+    x = cv2.resize(x, dsize=SIZE[::-1], interpolation=cv2.INTER_CUBIC)
     # Data augmentation:
     if geom_aug is not None:
         x = geom_aug.augment_image(x)
@@ -524,13 +460,13 @@ def _transform(x, size, preprocess_input_fn, geom_aug=None, color_aug=None):
 
     # to float32
     x = x.astype(np.float32)
-    x = preprocess_input_fn(x)
+    x = preprocess_input(x)
     return x
 
 
-def _transform_fn(x, size, preprocess_input_fn):
-    return _transform(x, size, preprocess_input_fn, train_geom_aug, None)
+def _transform_fn(x):
+    return _transform(x, train_geom_aug, train_color_aug)
 
 
-def _transform_test_fn(x, size, preprocess_input_fn):
-    return _transform(x, size, preprocess_input_fn, test_geom_aug, test_color_aug)
+def _transform_test_fn(x):
+    return _transform(x, test_geom_aug, test_color_aug)

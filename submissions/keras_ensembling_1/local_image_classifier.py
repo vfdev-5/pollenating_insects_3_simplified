@@ -17,7 +17,7 @@ from skimage.io import imread as skimage_imread
 from keras import backend as K
 from keras.models import Model
 from keras.layers import Dense, GlobalAveragePooling2D
-from keras.optimizers import Adam
+from keras.optimizers import Adam, RMSprop
 from keras.callbacks import ReduceLROnPlateau, ModelCheckpoint, LearningRateScheduler
 from keras.losses import categorical_crossentropy
 
@@ -33,7 +33,7 @@ SUBMIT_NAME = os.path.basename(os.path.dirname(__file__))
 
 SEED = 123456789
 N_JOBS = 10
-SIZE = (224, 224)  # Minimal size for ResNet50
+SIZE = (197, 197)  # Minimal size for ResNet50
 
 
 class ImageClassifier(object):
@@ -48,8 +48,11 @@ class ImageClassifier(object):
             0.000234,  # inception-resnet
             0.000123,  # resnet
             0.000234,  # xception
-            0.000015,  # densenet
+            0.000075,  # densenet
         ]
+        # 0.0045 Too high
+        # 0.000678 Rather high
+        # 0.000234
 
         if 'LOGS_PATH' in os.environ:
             self.logs_path = os.environ['LOGS_PATH']
@@ -247,7 +250,7 @@ class ImageClassifier(object):
         best_params = {
             'test-%s-mean' % params['eval_metric']: 1e10,
             'params': params,
-            'num_boost_round': 2500
+            'num_boost_round': 1000
         }
 
         print("Params : ", params)
@@ -268,6 +271,139 @@ class ImageClassifier(object):
             print("Best cv result: ", cvresult.loc[cvresult.index[-1], :])
             print("Best params: ", params)
             print("num_boost_round: ", num_boost_round)
+
+        # Train model
+        dtrain = xgb.DMatrix(y_topk_preds, label=y_true)
+        self.second_level_model = xgb.train(best_params['params'],
+                                            dtrain,
+                                            num_boost_round=best_params['num_boost_round'],
+                                            evals=[(dtrain, 'train')], verbose_eval=25)
+        self._save_second_level_model()
+
+    def _train_second_level_(self, x, y_true):
+
+        second_level_model_filename = os.path.join(self.logs_path, "second_level_model.xgb")
+        if os.path.exists(second_level_model_filename):
+            print("Load second level model found at %s" % second_level_model_filename)
+            self.second_level_model = xgb.Booster(model_file=second_level_model_filename)
+            return
+
+        seed = SEED
+        n_folds = 5
+
+        # Select top-3 predicted classes:
+        y_topk_preds = self._compute_topk(x, k=3)
+
+        # Stratified split
+        sssplit = StratifiedShuffleSplit(n_splits=n_folds, test_size=0.2)
+        train_indices, val_indices = next(sssplit.split(y_topk_preds, y_true))
+
+        # 2nd level:
+        print("\n\n Second level training \n")
+        dtrain = xgb.DMatrix(y_topk_preds[train_indices], label=y_true[train_indices])
+        dval = xgb.DMatrix(y_topk_preds[val_indices], label=y_true[val_indices])
+
+        # OK
+        # params = {
+        #     "objective": "multi:softmax",
+        #     "booster": "gbtree",
+        #     "eval_metric": "mlogloss",
+        #     "eta": 0.0238911817853,
+        #     "tree_method": 'auto',
+        #     "max_depth": 2,
+        #     "subsample": 0.50591952301,
+        #     "colsample_bytree": 0.825739561924,
+        #     "silent": 1,
+        #     "seed": seed,
+        #     "num_class": 403
+        # }
+
+        # OK
+        # params = {
+        #     "objective": "multi:softmax",
+        #     "booster": "gbtree",
+        #     "eval_metric": "mlogloss",
+        #     "eta": 0.0238911817853,
+        #     "tree_method": 'auto',
+        #     "max_depth": 2,
+        #     "subsample": 0.90,
+        #     "colsample_bytree": 0.825739561924,
+        #     "silent": 1,
+        #     "seed": seed,
+        #     "num_class": 403
+        # }
+
+        # OK
+        # params = {
+        #     "objective": "multi:softmax",
+        #     "booster": "gbtree",
+        #     "eval_metric": "mlogloss",
+        #     "eta": 0.0238911817853,
+        #     "tree_method": 'auto',
+        #     "max_depth": 2,
+        #     "subsample": 0.90,
+        #     "colsample_bytree": 0.90,
+        #     "silent": 1,
+        #     "seed": seed,
+        #     "num_class": 403
+        # }
+
+        params = {
+            "objective": "multi:softmax",
+            "booster": "gbtree",
+            "eval_metric": "mlogloss",
+            "eta": 0.027,
+            "tree_method": 'auto',
+            "max_depth": 2,
+            "subsample": 0.90,
+            "colsample_bytree": 0.90,
+            "silent": 1,
+            "seed": seed,
+            "num_class": 403
+        }
+
+        # params = {
+        #     "objective": "multi:softmax",
+        #     "booster": "gbtree",
+        #     "eval_metric": "mlogloss",
+        #     "eta": 0.0238911817853,
+        #     "tree_method": 'auto',
+        #     "max_depth": 3,
+        #     "subsample": 0.90,
+        #     "colsample_bytree": 0.90,
+        #     "silent": 1,
+        #     "seed": seed,
+        #     "num_class": 403
+        # }
+
+        best_params = {
+            'test-%s-mean' % params['eval_metric']: 1e10,
+            'params': {},
+            'num_boost_round': 0
+        }
+
+        print("Params : ", params)
+
+        watchlist = [(dtrain, 'train'), (dval, 'eval')]
+        num_boost_round = 2500
+        early_stopping_rounds = 15
+        evals_result = {}
+        gbm = xgb.train(params, dtrain, num_boost_round,
+                        evals=watchlist,
+                        early_stopping_rounds=early_stopping_rounds,
+                        evals_result=evals_result,
+                        verbose_eval=1)
+
+        print("Best score: ", gbm.best_score)
+        best_params['test-%s-mean' % params['eval_metric']] = \
+            evals_result['eval'][params['eval_metric']][gbm.best_ntree_limit]
+        best_params['num_boost_round'] = gbm.best_ntree_limit
+        best_params['params'] = params
+
+        print("gbm.best_iteration=", gbm.best_iteration)
+        print("gbm.best_ntree_limit=", gbm.best_ntree_limit)
+
+        print("Best params : ", best_params)
 
         # Train model
         dtrain = xgb.DMatrix(y_topk_preds, label=y_true)
@@ -329,6 +465,7 @@ class ImageClassifier(object):
         model.compile(
             loss=loss,
             optimizer=Adam(lr=lr),
+            # optimizer=RMSprop(lr=lr, epsilon=1.0),
             metrics=['accuracy', f170])
 
     def _build_models(self):

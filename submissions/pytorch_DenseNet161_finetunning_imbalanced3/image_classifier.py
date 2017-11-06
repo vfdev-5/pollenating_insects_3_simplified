@@ -32,10 +32,33 @@ from torchvision.transforms import Compose, Normalize, ToTensor
 HAS_GPU = torch.cuda.is_available()
 SUBMIT_NAME = os.path.basename(os.path.dirname(__file__))
 
-SIZE = (452, 452)
-SEED = 12345
+################################################################################################################
+# Principal configuration
 
-print("HAS_GPU: {}".format(HAS_GPU))
+if 'CONFIGURATION' in os.environ:
+    import json
+    conf_file_path = os.environ['CONFIGURATION']
+    assert os.path.exists(conf_file_path)
+    with open(conf_file_path, 'r') as r:
+        CONFIGURATION = json.load(r)
+else:
+    CONFIGURATION = {
+        'seed': 12345,
+        'image_size': (352, 352),
+        # Dataflow:
+        'n_splits': 7,  # Stratified KFolds data split
+        'split_index': 0,  # index of fold to use for training
+
+    }
+
+################################################################################################################
+#
+
+
+################################################################################################################
+
+SIZE = CONFIGURATION['image_size']
+SEED = CONFIGURATION['seed']
 
 
 class Flatten(Module):
@@ -81,9 +104,9 @@ class ImageClassifier(object):
         if HAS_GPU:
             self.net = self.net.cuda()
 
-        self.batch_size = 6
+        self.batch_size = 12
         self.n_epochs = 10
-        self.n_workers = 2
+        self.n_workers = 4
         self.n_splits = 7
         self.n_tta = 10
         self.lr = 0.000075
@@ -133,21 +156,22 @@ class ImageClassifier(object):
         ])
         return test_transforms
 
-    def _get_trainval_datasets(self, img_loader, n_splits=5, seed=12345, batch_size=32, num_workers=4):
+    def _get_trainval_datasets(self, img_loader):
+
+        n_splits = CONFIGURATION['n_splits']
+        split_index = CONFIGURATION['split_index']
+        seed = CONFIGURATION['seed']
+        batch_size = CONFIGURATION['batch_size']
+        num_workers = CONFIGURATION['num_workers']
 
         train_ds = ImageLoaderProxyDataset(img_loader)
         # Resize to 512x512
         train_ds = ResizedDataset(train_ds, (512, 512))
         # Stratified splits:
-        n_samples = len(img_loader)
-        X = np.zeros(n_samples)
-        Y = np.zeros(n_samples, dtype=np.int)
-        for i, label in enumerate(img_loader.y_array):
-            Y[i] = label
         kfolds_train_indices = []
         kfolds_val_indices = []
         skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-        for train_indices, val_indices in skf.split(X, Y):
+        for train_indices, val_indices in skf.split(img_loader.X_array, img_loader.y_array):
             kfolds_train_indices.append(train_indices)
             kfolds_val_indices.append(val_indices)
         kfold_samplers = []
@@ -162,7 +186,6 @@ class ImageClassifier(object):
         data_aug_val_ds = TransformedDataset(train_ds, x_transforms=test_transforms)
 
         # Dataloader prefetch + batching
-        split_index = 0
         if HAS_GPU:
             train_batches_ds = OnGPUDataLoader(data_aug_train_ds,
                                                batch_size=batch_size,
@@ -583,30 +606,6 @@ class RandomCrop:
             return 0, 0, h, w
         i = np.random.randint(0, h - th)
         j = np.random.randint(0, w - tw)
-        return i, j, th, tw
-
-    def __call__(self, img):
-        if self.padding > 0:
-            img = np.pad(img, self.padding, mode='edge')
-        i, j, h, w = self.get_params(img, self.size)
-        return img[i:i + h, j:j + w, :]
-
-
-class CenterCrop:
-
-    def __init__(self, size, padding=0):
-        assert len(size) == 2
-        self.size = size
-        self.padding = padding
-
-    @staticmethod
-    def get_params(img, output_size):
-        h, w, _ = img.shape
-        th, tw = output_size
-        if w == tw and h == th:
-            return 0, 0, h, w
-        i = (h - th) // 2
-        j = (w - tw) // 2
         return i, j, th, tw
 
     def __call__(self, img):

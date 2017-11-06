@@ -32,7 +32,7 @@ from torchvision.transforms import Compose, Normalize, ToTensor
 HAS_GPU = torch.cuda.is_available()
 SUBMIT_NAME = os.path.basename(os.path.dirname(__file__))
 
-SIZE = (452, 452)
+SIZE = (299, 299)
 SEED = 12345
 
 print("HAS_GPU: {}".format(HAS_GPU))
@@ -82,11 +82,11 @@ class ImageClassifier(object):
             self.net = self.net.cuda()
 
         self.batch_size = 6
-        self.n_epochs = 10
-        self.n_workers = 2
+        self.n_epochs = 12
+        self.n_workers = 4
         self.n_splits = 7
         self.n_tta = 10
-        self.lr = 0.000075
+        self.lr = 0.000015
 
     def _get_train_aug(self):
         # http://pytorch.org/docs/master/torchvision/models.html

@@ -26,7 +26,8 @@ from keras.applications.resnet50 import ResNet50, preprocess_input as resnet_pre
 from keras.applications.inception_resnet_v2 import InceptionResNetV2, preprocess_input as irv2_preprocess_input
 from keras_contrib.applications.densenet import DenseNetImageNet161, preprocess_input as densenet_preprocess_input
 
-import xgboost as xgb
+# import xgboost as xgb
+from sklearn.ensemble import GradientBoostingClassifier
 
 
 SUBMIT_NAME = os.path.basename(os.path.dirname(__file__))
@@ -42,7 +43,7 @@ class ImageClassifier(object):
 
         self.batch_size = 16
         self.valid_ratio = 0.2
-        self.n_epochs = 6
+        self.n_epochs = 2
         self.n_tta = 10
         self.learning_rates = [
             0.000234,  # inception-resnet
@@ -131,93 +132,12 @@ class ImageClassifier(object):
                                                             axis=1)[:, ::-1][:, :k]
         return y_topk_preds.astype(np.int)
 
-    def _train_second_level_with_randomsearch(self, x, y_true):
-        # THIS CODE IS NOT USED - VERY VERY SLOW
-        seed = SEED
-        n_folds = 5
-
-        # Select top-3 predicted classes:
-        y_topk_preds = self._compute_topk(x, k=3)
-
-        # 2nd level:
-        print("\n\n Second level training \n")
-        dtrainval = xgb.DMatrix(y_topk_preds, label=y_true)
-
-        params = {
-            "objective": "multi:softmax",
-            "booster": "gbtree",
-            "eval_metric": "mlogloss",
-            "eta": None,
-            "tree_method": 'auto',
-            "max_depth": None,
-            "subsample": None,
-            "colsample_bytree": None,
-            "silent": 1,
-            "seed": None,
-            "num_class": 403
-        }
-
-        best_params = {
-            'test-%s-mean' % params['eval_metric']: 1e10,
-            'params': {},
-            'num_boost_round': 0
-        }
-
-        # Search for the best parameters using CV
-
-        def generate_params():
-            eta = np.random.uniform(0.05, 0.001)
-            max_depth = np.random.randint(2, 4)
-            subsample = np.random.uniform(0.5, 0.95)
-            colsample_bytree = np.random.uniform(0.5, 0.95)
-            return eta, max_depth, subsample, colsample_bytree
-
-        np.random.seed(seed)
-        for i in range(10):
-
-            eta, max_depth, subsample, colsample_bytree = generate_params()
-            i += 1
-            seed += i - 1
-            print('\n{} : XGBoost params. ETA: {}, MAX_DEPTH: {}, SUBSAMPLE: {}, COLSAMPLE_BY_TREE: {}'
-                  .format(i, eta, max_depth, subsample, colsample_bytree))
-            num_boost_round = 1000
-            early_stopping_rounds = 15
-
-            params['eta'] = eta
-            params['max_depth'] = max_depth
-            params['subsample'] = subsample
-            params['colsample_bytree'] = colsample_bytree
-            params['seed'] = seed
-
-            cvresult = xgb.cv(params, dtrain=dtrainval,
-                              seed=params['seed'],
-                              num_boost_round=num_boost_round,
-                              early_stopping_rounds=early_stopping_rounds,
-                              nfold=n_folds,
-                              verbose_eval=25)
-
-            min_test_eval_metric_mean = cvresult['test-%s-mean' % params['eval_metric']].min()
-            if best_params['test-%s-mean' % params['eval_metric']] > min_test_eval_metric_mean:
-                best_params['test-%s-mean' % params['eval_metric']] = min_test_eval_metric_mean
-                best_params['params'] = params
-                best_params['num_boost_round'] = len(cvresult)
-                print("Best cv result: ", cvresult.loc[cvresult.index[-1], :])
-                print("Best params: ", params)
-
-        # Train model
-        dtrain = xgb.DMatrix(y_topk_preds, label=y_true)
-        self.second_level_model = xgb.train(best_params['params'],
-                                            dtrain,
-                                            num_boost_round=best_params['num_boost_round'],
-                                            evals=[(dtrain, 'train')], verbose_eval=25)
-        self._save_second_level_model()
-
     def _train_second_level(self, x, y_true):
 
         second_level_model_filename = os.path.join(self.logs_path, "second_level_model.xgb")
         if os.path.exists(second_level_model_filename):
-            print("Load second level model found at %s" % second_level_model_filename)
-            self.second_level_model = xgb.Booster(model_file=second_level_model_filename)
+            # print("Load second level model found at %s" % second_level_model_filename)
+            # self.second_level_model = xgb.Booster(model_file=second_level_model_filename)
             return
 
         seed = SEED
@@ -228,6 +148,10 @@ class ImageClassifier(object):
 
         # 2nd level:
         print("\n\n Second level training \n")
+
+        GradientBoostingClassifier()
+
+
         dtrainval = xgb.DMatrix(y_topk_preds, label=y_true)
 
         params = {

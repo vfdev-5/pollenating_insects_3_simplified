@@ -21,18 +21,18 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.dataloader import DataLoaderIter
 from torch.utils.data.sampler import SubsetRandomSampler
 from torch.optim.lr_scheduler import ExponentialLR, ReduceLROnPlateau
-from torch.nn import Linear, Module, Sequential, AdaptiveAvgPool2d
+from torch.nn import Module
 from torch.autograd import Variable
 from torch.optim import Adam
 
-from torchvision.models import densenet161
+from torchvision.models import squeezenet1_1
 from torchvision.transforms import Compose, Normalize, ToTensor
 
 
 HAS_GPU = torch.cuda.is_available()
 SUBMIT_NAME = os.path.basename(os.path.dirname(__file__))
 
-SIZE = (452, 452)
+SIZE = (299, 299)
 SEED = 12345
 
 print("HAS_GPU: {}".format(HAS_GPU))
@@ -43,18 +43,21 @@ class Flatten(Module):
         return x.view(x.size(0), -1)
 
 
-class DenseNet161PollenatingInsects(Module):
+class SqueezeNetPollenatingInsects(Module):
 
     def __init__(self):
-        super(DenseNet161PollenatingInsects, self).__init__()
-        densenet = densenet161(pretrained=True)
+        super(SqueezeNetPollenatingInsects, self).__init__()
+        squeezenet = squeezenet1_1(pretrained=True)
 
-        self.features = densenet.features
+        self.features = squeezenet.features
 
-        self.classifier = Sequential(
-            AdaptiveAvgPool2d(1),
-            Flatten(),
-            Linear(densenet.classifier.in_features, 403)
+        # Final convolution is initialized differently form the rest
+        self.classifier = nn.Sequential(
+            nn.Dropout(p=0.5),
+            nn.Conv2d(512, 403, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.AvgPool2d(13),
+            Flatten()
         )
 
     def forward(self, x):
@@ -75,18 +78,22 @@ class ImageClassifier(object):
 
         if not os.path.exists(self.logs_path):
             os.makedirs(self.logs_path)
-        self.net = DenseNet161PollenatingInsects()
+        self.net = SqueezeNetPollenatingInsects()
         print_trainable_parameters(self.net)
 
         if HAS_GPU:
             self.net = self.net.cuda()
 
-        self.batch_size = 6
-        self.n_epochs = 10
-        self.n_workers = 2
+        self.batch_size = 64
+        self.n_epochs = 12
+        self.n_workers = 6
         self.n_splits = 7
         self.n_tta = 10
-        self.lr = 0.000075
+        self.lr = 0.00006789
+        self.exp_decay_factor = 0.879
+        self.clip_gradients_val = None
+
+        self._write_conf_log("{}".format(self.__dict__))
 
     def _get_train_aug(self):
         # http://pytorch.org/docs/master/torchvision/models.html
@@ -100,15 +107,12 @@ class ImageClassifier(object):
                 RandomFlip(proba=0.5, mode='h'),
                 RandomFlip(proba=0.5, mode='v'),
             ]),
-            # Color
-            # RandomChoice([
-            #    RandomAdd(value=(-10, 10), per_channel=0),
-            #    RandomAdd(value=(-10, 10), per_channel=1),
-            #    RandomAdd(value=(-10, 10), per_channel=2),
-            #    RandomAdd(value=(-10, 10))
-            # ]),
             # To Tensor (float, CxHxW, [0.0, 1.0]) + Normalize
             ToTensor(),
+            # Color
+            # ColorJitter(brightness=0.25,
+            #             contrast=0.25,
+            #             saturation=0.25),
             Normalize(mean_val, std_val)
         ])
         return train_transforms
@@ -126,9 +130,12 @@ class ImageClassifier(object):
                 RandomFlip(proba=0.5, mode='v'),
             ]),
             # Color
-            # RandomAdd(value=(-10, 10)),
             # To Tensor (float, CxHxW, [0.0, 1.0])  + Normalize
             ToTensor(),
+            # Color
+            # ColorJitter(brightness=0.25,
+            #             contrast=0.25,
+            #             saturation=0.25),
             Normalize(mean_val, std_val)
         ])
         return test_transforms
@@ -237,6 +244,11 @@ class ImageClassifier(object):
                     # compute gradient and do optimizer step
                     optimizer.zero_grad()
                     loss.backward()
+
+                    # Clip gradients:
+                    if self.clip_gradients_val is not None:
+                        nn.utils.clip_grad_norm(model.parameters(), 2.0)
+
                     optimizer.step()
 
                     prefix_str = "Epoch: {}/{}".format(epoch + 1, n_epochs)
@@ -267,7 +279,7 @@ class ImageClassifier(object):
             with get_tqdm(total=len(val_batches)) as pbar:
                 for i, (batch_x, batch_y) in enumerate(val_batches):
                     batch_x = Variable(batch_x, volatile=True)
-                    batch_y = Variable(batch_y, volatile=True)   # see http://pytorch.org/docs/master/autograd.html#variable
+                    batch_y = Variable(batch_y, volatile=True)
                     # compute output
                     batch_y_pred = model(batch_x)
                     loss = criterion(batch_y_pred, batch_y)
@@ -312,18 +324,26 @@ class ImageClassifier(object):
 
     def _write_csv_log(self, line):
         csv_file = os.path.join(self.logs_path, 'log.csv')
-        d = 'w' if not os.path.exists(csv_file) else 'a'
-        with open(csv_file, d) as w:
+        self._write_log(csv_file, line)
+
+    def _write_conf_log(self, line):
+        conf_file = os.path.join(self.logs_path, 'conf.log')
+        self._write_log(conf_file, line)
+
+    def _write_log(self, filename, line):
+        d = 'w' if not os.path.exists(filename) else 'a'
+        with open(filename, d) as w:
             w.write(line + '\n')
 
     def _verbose_optimizer(self, optimizer):
-        print("\nOptimizer parameters: ")
+        msg = "\nOptimizer parameters: \n"
         for pg in optimizer.param_groups:
-            print("- Param group: ")
+            msg += "- Param group: \n"
             for k in pg:
                 if k == 'params':
                     continue
-                print("\t{}: {}".format(k, pg[k]))
+                msg += "\t{}: {}\n".format(k, pg[k])
+        return msg
 
     def fit(self, img_loader):
 
@@ -340,10 +360,17 @@ class ImageClassifier(object):
             'params': self.net.classifier.parameters(),
             'lr': 10*lr
         }])
+        #,
+        # betas=(0.01, 0.999),
+        #eps=1.0)
+
+        self._write_conf_log(self._verbose_optimizer(optimizer))
+
         criterion = nn.CrossEntropyLoss()
         if HAS_GPU:
             criterion = criterion.cuda()
-        scheduler = ExponentialLR(optimizer, gamma=0.925)
+        # lr <- lr_init * gamma ** epoch
+        scheduler = ExponentialLR(optimizer, gamma=self.exp_decay_factor)
         onplateau_scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=2, verbose=True)
 
         train_batches_ds, val_batches_ds = self._get_trainval_datasets(img_loader,
@@ -356,7 +383,7 @@ class ImageClassifier(object):
         for epoch in range(n_epochs):
             scheduler.step()
             # Verbose learning rates:
-            self._verbose_optimizer(optimizer)
+            print(self._verbose_optimizer(optimizer))
 
             # train for one epoch
             train_loss, train_prec1, _ = \
@@ -530,7 +557,7 @@ class OnGPUDataLoader(DataLoader):
         return OnGPUDataLoaderIter(self)
 
 
-class RandomOrder:
+class RandomOrder(object):
 
     def __init__(self, transforms):
         assert transforms is not None
@@ -543,7 +570,7 @@ class RandomOrder:
         return img
 
 
-class RandomChoice:
+class RandomChoice(object):
 
     def __init__(self, transforms):
         assert transforms is not None
@@ -554,7 +581,7 @@ class RandomChoice:
         return self.transforms[c](img)
 
 
-class RandomFlip:
+class RandomFlip(object):
 
     def __init__(self, proba=0.5, mode='h'):
         assert mode in ['h', 'v']
@@ -568,7 +595,7 @@ class RandomFlip:
         return cv2.flip(img, flipCode)
 
 
-class RandomCrop:
+class RandomCrop(object):
 
     def __init__(self, size, padding=0):
         assert len(size) == 2
@@ -592,7 +619,7 @@ class RandomCrop:
         return img[i:i + h, j:j + w, :]
 
 
-class CenterCrop:
+class CenterCrop(object):
 
     def __init__(self, size, padding=0):
         assert len(size) == 2
@@ -616,7 +643,7 @@ class CenterCrop:
         return img[i:i + h, j:j + w, :]
 
 
-class RandomAffine:
+class RandomAffine(object):
 
     def __init__(self, rotation=(-90, 90), scale=(0.85, 1.15), translate=(0.2, 0.2)):
         self.rotation = rotation
@@ -643,7 +670,7 @@ class RandomAffine:
         return ret
 
 
-class RandomAdd:
+class RandomAdd(object):
 
     def __init__(self, proba=0.5, value=(-0, 0), per_channel=None):
         self.proba = proba
@@ -663,7 +690,86 @@ class RandomAdd:
         return out
 
 
-class AverageMeter:
+class Grayscale(object):
+
+    def __call__(self, img):
+        gs = img.clone()
+        gs[0].mul_(0.299).add_(0.587, gs[1]).add_(0.114, gs[2])
+        gs[1].copy_(gs[0])
+        gs[2].copy_(gs[0])
+        return gs
+
+
+class AlphaLerp(object):
+
+    def __init__(self, var):
+        if isinstance(var, (tuple, list)):
+            assert len(var) == 2
+            self.min_val = var[0]
+            self.max_val = var[1]
+        else:
+            self.min_val = 0
+            self.max_val = var
+
+    def get_alpha(self):
+        return np.random.uniform(self.min_val, self.max_val)
+
+    def get_end_image(self, img):
+        raise NotImplementedError
+
+    def __call__(self, img):
+        return img.lerp(self.get_end_image(img), self.get_alpha())
+
+
+class Saturation(AlphaLerp):
+
+    def __init__(self, var):
+        super(Saturation, self).__init__(var)
+
+    def get_end_image(self, img):
+        return Grayscale()(img)
+
+
+class Brightness(AlphaLerp):
+
+    def __init__(self, var):
+        super(Brightness, self).__init__(var)
+
+    def get_end_image(self, img):
+        return img.new().resize_as_(img).zero_()
+
+
+class Contrast(AlphaLerp):
+
+    def __init__(self, var):
+        super(Contrast, self).__init__(var)
+
+    def get_end_image(self, img):
+        gs = Grayscale()(img)
+        gs.fill_(gs.mean())
+        return gs
+
+
+class ColorJitter(RandomOrder):
+
+    def __init__(self, brightness=None, contrast=None, saturation=None):
+        """
+        :param brightness: int or tuple: (min, max) with min < max in [0.0, 1.0]
+        :param contrast: int or tuple: (min, max) with min < max in [0.0, 1.0]
+        :param saturation: int or tuple: (min, max) with min < max in [0.0, 1.0]
+        """
+        assert brightness or contrast or saturation
+        transforms = []
+        if brightness is not None:
+            transforms.append(Brightness(brightness))
+        if contrast is not None:
+            transforms.append(Contrast(contrast))
+        if saturation is not None:
+            transforms.append(Saturation(saturation))
+        super(ColorJitter, self).__init__(transforms)
+
+
+class AverageMeter(object):
     """Computes and stores the average and current value"""
     def __init__(self):
         self.reset()
