@@ -6,7 +6,7 @@ from glob import glob
 import numpy as np
 import cv2
 
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedShuffleSplit
 
 try:
     from tqdm import tqdm
@@ -23,10 +23,12 @@ from torch.utils.data.sampler import SubsetRandomSampler
 from torch.optim.lr_scheduler import ExponentialLR, ReduceLROnPlateau
 from torch.nn import Module
 from torch.autograd import Variable
-from torch.optim import Adam
+from torch.optim import RMSprop
 
 from torchvision.models import squeezenet1_1
 from torchvision.transforms import Compose, Normalize, ToTensor
+
+from imblearn.over_sampling import RandomOverSampler
 
 
 HAS_GPU = torch.cuda.is_available()
@@ -53,7 +55,7 @@ class SqueezeNetPollenatingInsects(Module):
 
         # Final convolution is initialized differently form the rest
         self.classifier = nn.Sequential(
-            nn.Dropout(p=0.5),
+            nn.Dropout(p=0.65),
             nn.Conv2d(512, 403, kernel_size=1),
             nn.ReLU(inplace=True),
             nn.AvgPool2d(13),
@@ -86,13 +88,13 @@ class ImageClassifier(object):
 
         self.batch_size = 64
         self.n_epochs = 15
-        self.n_workers = 6
-        self.n_splits = 7
+        self.n_workers = 12
+        self.n_splits = 10
+        self.val_ratio = 0.10
         self.n_tta = 10
-        self.lr = 0.00005678
-        self.exp_decay_factor = 0.925
+        self.lr = 0.00012345
+        self.exp_decay_factor = 0.5678
         self.clip_gradients_val = None
-
         self._write_conf_log("{}".format(self.__dict__))
 
     def _get_train_aug(self):
@@ -103,16 +105,13 @@ class ImageClassifier(object):
             RandomCrop(SIZE),
             # Geometry
             RandomChoice([
-                RandomAffine(rotation=(-60, 60), scale=(0.95, 1.05), translate=(0.05, 0.05)),
+                RandomAffine(rotation=(-90, 90), scale=(0.85, 1.15), translate=(0.15, 0.15)),
                 RandomFlip(proba=0.5, mode='h'),
                 RandomFlip(proba=0.5, mode='v'),
             ]),
             # To Tensor (float, CxHxW, [0.0, 1.0]) + Normalize
             ToTensor(),
-            # Color
-            # ColorJitter(brightness=0.25,
-            #             contrast=0.25,
-            #             saturation=0.25),
+            ColorJitter(brightness=0.4, saturation=0.4, contrast=0.4),
             Normalize(mean_val, std_val)
         ])
         return train_transforms
@@ -132,35 +131,27 @@ class ImageClassifier(object):
             # Color
             # To Tensor (float, CxHxW, [0.0, 1.0])  + Normalize
             ToTensor(),
-            # Color
-            # ColorJitter(brightness=0.25,
-            #             contrast=0.25,
-            #             saturation=0.25),
             Normalize(mean_val, std_val)
         ])
         return test_transforms
 
-    def _get_trainval_datasets(self, img_loader, n_splits=5, seed=12345, batch_size=32, num_workers=4):
+    def _get_trainval_datasets(self, img_loader, n_splits=5, val_size=0.1, seed=12345, batch_size=32, num_workers=4):
 
         train_ds = ImageLoaderProxyDataset(img_loader)
         # Resize to 512x512
         train_ds = ResizedDataset(train_ds, (512, 512))
-        # Stratified splits:
-        n_samples = len(img_loader)
-        X = np.zeros(n_samples)
-        Y = np.zeros(n_samples, dtype=np.int)
-        for i, label in enumerate(img_loader.y_array):
-            Y[i] = label
-        kfolds_train_indices = []
-        kfolds_val_indices = []
-        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-        for train_indices, val_indices in skf.split(X, Y):
-            kfolds_train_indices.append(train_indices)
-            kfolds_val_indices.append(val_indices)
-        kfold_samplers = []
-        for train_indices, val_indices in zip(kfolds_train_indices, kfolds_val_indices):
-            kfold_samplers.append({"train": SubsetRandomSampler(train_indices),
-                                   "val": SubsetRandomSampler(val_indices)})
+        # Stratified split:        
+        sssplit = StratifiedShuffleSplit(n_splits=n_splits, test_size=val_size, random_state=seed)
+        train_indices, val_indices = next(sssplit.split(img_loader.X_array, img_loader.y_array))
+
+        # Compute class weights and sample weights for training dataset
+        train_y_array = img_loader.y_array[train_indices]
+        new_indices = over_sample(train_y_array, oversampling_threshold=350)
+        new_train_indices = train_indices[new_indices]
+
+        train_sampler = SubsetRandomSampler(new_train_indices)
+        val_sampler = SubsetRandomSampler(val_indices)
+
         # Data augmentations:
         train_transforms = self._get_train_aug()
         test_transforms = self._get_test_aug()
@@ -169,17 +160,16 @@ class ImageClassifier(object):
         data_aug_val_ds = TransformedDataset(train_ds, x_transforms=test_transforms)
 
         # Dataloader prefetch + batching
-        split_index = 0
         if HAS_GPU:
             train_batches_ds = OnGPUDataLoader(data_aug_train_ds,
                                                batch_size=batch_size,
-                                               sampler=kfold_samplers[split_index]["train"],
+                                               sampler=train_sampler,
                                                num_workers=num_workers,
                                                drop_last=True,
                                                pin_memory=True)
             val_batches_ds = OnGPUDataLoader(data_aug_val_ds,
                                              batch_size=batch_size,
-                                             sampler=kfold_samplers[split_index]["val"],
+                                             sampler=val_sampler,
                                              num_workers=num_workers,
                                              drop_last=True,
                                              pin_memory=True)
@@ -187,12 +177,12 @@ class ImageClassifier(object):
 
         train_batches_ds = DataLoader(data_aug_train_ds,
                                       batch_size=batch_size,
-                                      sampler=kfold_samplers[split_index]["train"],
+                                      sampler=train_sampler,
                                       num_workers=num_workers,
                                       drop_last=True)
         val_batches_ds = DataLoader(data_aug_val_ds,
                                     batch_size=batch_size,
-                                    sampler=kfold_samplers[split_index]["val"],
+                                    sampler=val_sampler,
                                     num_workers=num_workers,
                                     drop_last=True)
         return train_batches_ds, val_batches_ds
@@ -356,18 +346,16 @@ class ImageClassifier(object):
         n_epochs = self.n_epochs
         num_workers = self.n_workers
         n_splits = self.n_splits
+        val_size = self.val_ratio
 
         lr = self.lr
-        optimizer = Adam([{
+        optimizer = RMSprop([{
             'params': self.net.features.parameters(),
             'lr': lr
         }, {
             'params': self.net.classifier.parameters(),
             'lr': 10*lr
         }])
-        #,
-        # betas=(0.01, 0.999),
-        #eps=1.0)
 
         self._write_conf_log(self._verbose_optimizer(optimizer))
 
@@ -381,6 +369,7 @@ class ImageClassifier(object):
         train_batches_ds, val_batches_ds = self._get_trainval_datasets(img_loader,
                                                                        seed=SEED,
                                                                        n_splits=n_splits,
+                                                                       val_size=val_size,
                                                                        batch_size=batch_size,
                                                                        num_workers=num_workers)
         self._write_csv_log("epoch,train_loss,train_prec1,val_loss,val_prec1")
@@ -441,6 +430,32 @@ class ImageClassifier(object):
 
         y_probas = np.mean(y_probas, axis=0)
         return y_probas
+
+
+# *********************************************************************************
+# Data balanced sampling
+# *********************************************************************************
+
+def over_sample(targets, oversampling_threshold=350):
+    # Oversample training data:
+    # - oversample randomly images that count is smaller a threshold
+
+    class_counts = np.zeros((403, ), dtype=np.int)
+    for class_index in targets:
+        class_counts[class_index] += 1
+
+    classes_to_oversample = np.where(class_counts < oversampling_threshold)[0]
+
+    indices_to_oversample = np.where(np.isin(targets, classes_to_oversample))[0]
+    other_indices = np.where(~np.isin(targets, classes_to_oversample))[0]
+
+    rs = RandomOverSampler()
+    indices_oversampled, _ = rs.fit_sample(indices_to_oversample[:, None],
+                                           targets[indices_to_oversample])
+    indices_oversampled = indices_oversampled.ravel()
+
+    new_indices = np.concatenate((other_indices, indices_oversampled))
+    return new_indices
 
 
 # *********************************************************************************
@@ -838,7 +853,7 @@ def get_tqdm_kwargs(**kwargs):
     )
     f = kwargs.get('file', sys.stderr)
     isatty = f.isatty()
-    # Jupyter notebook should be recognized as tty. Wait for
+    # Jupyter notebook should be recognized as tty. Wait for 
     # https://github.com/ipython/ipykernel/issues/268
     try:
         from ipykernel import iostream

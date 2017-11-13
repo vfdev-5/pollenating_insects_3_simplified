@@ -128,7 +128,7 @@ class PrintLabelsStats:
     def __len__(self):
         return len(self.ds)
     
-    def __getitem__(self):        
+    def __iter__(self):
         iterator = self.ds.__iter__()
         batch_x, batch_y = next(iterator)
         y_stats = defaultdict(int)
@@ -146,8 +146,10 @@ class PrintLabelsStats:
             print('')
             if self.display_total:
                 print("    total: | ", end='')
-                for k in self.total_y_stats:
-                    print("'{}': {} |".format(str(k), self.total_y_stats[k]), end=' ')
+                for i, k in enumerate(self.total_y_stats):
+                    if i > 0 and i % 6 == 0:
+                        print("")
+                    print("'{0:0>3}': {1: >5}".format(k, self.total_y_stats[k]), end=' | ')
                 print('')                    
         self.cnt += 1
         return iterator
