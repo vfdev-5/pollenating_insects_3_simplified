@@ -17,7 +17,35 @@ class ToNumpy(object):
         return np.asarray(img)
 
 
+class Resize(object):
+
+    def __init__(self, output_size, interpolation=cv2.INTER_CUBIC):
+        self.output_size = output_size
+        self.interpolation = interpolation
+
+    def __call__(self, img):
+        # RGBA -> RGB
+        if img.shape[2] == 4:
+            img = img[:, :, 0:3]
+        img = cv2.resize(img, dsize=self.output_size, interpolation=self.interpolation)
+        return img
+
+
+class RandomApply(object):
+
+    def __init__(self, transform, proba=0.5):
+        assert transform is not None and callable(transform)
+        self.transform = transform
+        self.proba = proba
+
+    def __call__(self, img):
+        if self.proba > np.random.rand():
+            return img
+        return self.transform(img)
+
+
 class RandomOrder(object):
+
     def __init__(self, transforms):
         assert transforms is not None
         self.transforms = transforms
@@ -106,12 +134,25 @@ class RandomAdd(object):
         return out
 
 
-class RandomCrop(object):
+class Crop(object):
 
     def __init__(self, size, padding=0):
         assert len(size) == 2
         self.size = size
         self.padding = padding
+
+    @staticmethod
+    def get_params(img, output_size):
+        raise NotImplementedError()
+
+    def __call__(self, img):
+        if self.padding > 0:
+            img = np.pad(img, self.padding, mode='edge')
+        i, j, h, w = self.get_params(img, self.size)
+        return img[i:i + h, j:j + w, :]
+
+
+class RandomCrop(Crop):
 
     @staticmethod
     def get_params(img, output_size):
@@ -123,11 +164,18 @@ class RandomCrop(object):
         j = np.random.randint(0, w - tw)
         return i, j, th, tw
 
-    def __call__(self, img):
-        if self.padding > 0:
-            img = np.pad(img, self.padding, mode='edge')
-        i, j, h, w = self.get_params(img, self.size)
-        return img[i:i + h, j:j + w, :]
+
+class CenterCrop(Crop):
+
+    @staticmethod
+    def get_params(img, output_size):
+        h, w, _ = img.shape
+        th, tw = output_size
+        if w == tw and h == th:
+            return 0, 0, h, w
+        i = (h - th) // 2
+        j = (w - tw) // 2
+        return i, j, th, tw
 
 
 # #### Next code is adapted from here :
@@ -182,10 +230,7 @@ class AlphaLerp(object):
         raise NotImplementedError
 
     def __call__(self, img):
-        alpha = self.get_alpha()
-        print("alpha: ", alpha)
-        # return img.lerp(self.get_end_image(img), self.get_alpha())
-        return img.lerp(self.get_end_image(img), alpha)
+        return img.lerp(self.get_end_image(img), self.get_alpha())
 
 
 class Saturation(AlphaLerp):
@@ -287,9 +332,8 @@ def object_hook(decoded_dict, custom_transforms=None):
         # decoded_dict contains kwargs and not class name
         return decoded_dict
     for k in decoded_dict:
-        # assert k in GLOBAL_TRANSFORMS or k in CUSTOM_TRANSFORMS, "Key '%s' is unknown" % k
-        if k in _GLOBAL_TRANSFORMS:
-            return _GLOBAL_TRANSFORMS[k](**decoded_dict[k]) if decoded_dict[k] is not None else _GLOBAL_TRANSFORMS[k]()
-        elif custom_transforms is not None and k in custom_transforms:
+        if custom_transforms is not None and k in custom_transforms:
             return custom_transforms[k](**decoded_dict[k]) if decoded_dict[k] is not None else custom_transforms[k]()
+        elif k in _GLOBAL_TRANSFORMS:
+            return _GLOBAL_TRANSFORMS[k](**decoded_dict[k]) if decoded_dict[k] is not None else _GLOBAL_TRANSFORMS[k]()
         return decoded_dict

@@ -325,7 +325,8 @@ class ImageClassifier(object):
             w.write(line + '\n')
 
     def _verbose_optimizer(self, optimizer):
-        msg = "\nOptimizer parameters: \n"
+        msg = "\nOptimizer: %s" % optimizer.__class__.__name__
+        msg += "Optimizer parameters: \n"
         for pg in optimizer.param_groups:
             msg += "- Param group: \n"
             for k in pg:

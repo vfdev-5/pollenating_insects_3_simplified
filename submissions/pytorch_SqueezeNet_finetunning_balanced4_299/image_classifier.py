@@ -92,8 +92,8 @@ class ImageClassifier(object):
         self.n_splits = 10
         self.val_ratio = 0.10
         self.n_tta = 10
-        self.lr = 0.00012345
-        self.exp_decay_factor = 0.5678
+        self.lr = 0.009876
+        self.exp_decay_factor = 0.8765
         self.clip_gradients_val = None
         self._write_conf_log("{}".format(self.__dict__))
 
@@ -351,10 +351,12 @@ class ImageClassifier(object):
         lr = self.lr
         optimizer = RMSprop([{
             'params': self.net.features.parameters(),
-            'lr': lr
+            'lr': lr,
+            'eps': 1.0,
         }, {
             'params': self.net.classifier.parameters(),
-            'lr': 10*lr
+            'lr': 10*lr,
+            'eps': 1.0,
         }])
 
         self._write_conf_log(self._verbose_optimizer(optimizer))
